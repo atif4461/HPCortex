@@ -1,6 +1,243 @@
 #include <HPCortex.hpp>
 #include <Testing.hpp>
 
+/**
+ * @brief Tests the functionality of the pipeline by executing various models and comparing results.
+ *
+ * This function tests the pipeline by creating and running multiple models,
+ * including testing the model value pipeline, loss pipeline, and batched cost pipeline.
+ 
+void testPipeline(){
+   * @brief Enables global pipelining across all ranks.
+ 
+communicators().enableGlobalPipelining(); 
+   * @brief Retrieves the number of ranks and the current rank in the pipeline.
+ 
+int nranks = communicators().pipelineNrank();
+int rank = communicators().pipelineRank();
+   * @brief Defines parameters for the model, including batch size and input features.
+ 
+int batch_size = 1;
+int input_features = 1;
+int input_dims[2] = {input_features, batch_size};  
+ * @brief Initializes constants used in the model.
+ 
+FloatType B=0.15;
+FloatType A=3.14;
+   * @brief Creates initial weights and bias matrices for the neural network layer.
+ 
+Matrix<FloatType> winit(1,1,A);
+Vector<FloatType> binit(1,B);
+int block_output_dims[2] = {1, batch_size};
+typedef decltype( dnn_layer(input_layer<FloatType>(), winit,binit) ) Ltype;
+ * @brief Tests the model value pipeline.
+ 
+if(1){ 
+     * @brief Prints a message indicating that the model value pipeline is being tested.
+   
+  if(!rank) std::cout << "Testing model value pipeline" << std::endl;
+
+     * @brief Creates a pipeline block for the neural network layer.
+   
+  auto p = pipeline_block< Matrix<FloatType>, Matrix<FloatType> >( dnn_layer(input_layer<FloatType>(), winit,binit), block_output_dims, rank == nranks - 1 ? input_dims : block_output_dims);
+  
+     * @brief Retrieves the value lag and derivative lag for the pipeline.
+   
+  int value_lag = p.valueLag(); 
+  int deriv_lag = p.derivLag(); 
+  
+     * @brief Defines the number of iterations for testing.
+   
+  int iters=20;
+
+     * @brief Builds the same model on the current rank.
+   
+  auto test_model = enwrap( input_layer<FloatType>() );
+  for(int r=0;r<nranks;r++) test_model = enwrap( dnn_layer(std::move(test_model), winit,binit) ); 
+
+     * @brief Computes expected values and derivatives for comparison.
+   
+  if(!rank) std::cout << "Computing expectations" << std::endl;
+  std::vector<Matrix<FloatType> > expect_v(iters);
+  std::vector<Vector<FloatType> > expect_d(iters, Vector<FloatType>(test_model.nparams()) );
+  
+  std::vector<Matrix<FloatType> > input_deriv(iters);
+  for(int i=0;i<iters;i++){
+    input_deriv[i] = Matrix<FloatType>(1,batch_size, 2.13*(i+1)); 
+    Matrix<FloatType> x(1,1, i+1);
+    expect_v[i] = test_model.value(x);
+
+    Matrix<FloatType> idcp(input_deriv[i]);
+    test_model.deriv(expect_d[i],0,std::move(idcp));
+  }
+  int nparams = test_model.nparams();
+
+     * @brief Starts the test loop for the model value pipeline.
+   
+  if(!rank) std::cout << "Starting test loop" << std::endl;
+  for(int i=0;i<iters;i++){
+    Matrix<FloatType> x(1,1, i+1);
+    Matrix<FloatType> v = p.value(x);
+    Vector<FloatType> d(nparams,0.);
+
+    int i_vpipe = i-(value_lag-1); 
+    p.deriv(d,i_vpipe >= 0? input_deriv[i_vpipe] : Matrix<FloatType>(1,batch_size,-1)); 
+    
+    if(!rank){
+      if(i_vpipe >=0 ){
+        autoView(ev_i_v, expect_v[i_vpipe], HostRead);
+        autoView(v_v,v,HostRead);
+        
+        FloatType ev = ev_i_v(0,0); 
+        std::cout << i << "\tval expect " << ev << " got "<<  v_v(0,0) << std::endl;
+        assert(near(ev,v_v(0,0),FloatType(1e-4)));
+      }
+      if(i_vpipe >=0 ){
+        Vector<FloatType> ed = expect_d[i_vpipe];   
+        std::cout << "\tderiv expect " << ed << " got " << d << std::endl;
+        assert(near(d,ed,FloatType(1e-4),true));
+      }
+    }
+  }
+}
+ * @brief Tests the loss pipeline.
+ 
+if(1){ 
+     * @brief Prints a message indicating that the loss pipeline is being tested.
+   
+  if(!rank) std::cout << "Testing loss pipeline" << std::endl;
+     * @brief Creates a pipeline block for the neural network layer.
+   
+  auto p = pipeline_block< Matrix<FloatType>, Matrix_FloatType> >( dnn_layer(input_layer<FloatType>(), winit,binit), block_output_dims, rank == nranks - 1 ? input_dims : block_output_dims);
+     * @brief Wraps the pipeline with a cost function wrapper.
+   
+  PipelineCostFuncWrapper<decltype(p),MSEcostFunc<Matrix<FloatType>> > pc(p);
+  int value_lag = p.valueLag();
+  int deriv_lag = p.derivLag();
+  
+     * @brief Builds the same model on the current rank.
+   
+  auto test_model = enwrap( input_layer<FloatType>() );
+  for(int r=0;r<nranks;r++) test_model = enwrap( dnn_layer(std::move(test_model), winit,binit) ); 
+     * @brief Computes the mean squared error cost.
+   
+  auto test_cost = mse_cost(test_model);
+
+  int nparams = p.nparams();
+  
+     * @brief Defines the number of iterations for testing.
+   
+  int iters=20;
+
+     * @brief Generates input and output data for testing.
+   
+  std::vector<Matrix<FloatType> > x(iters);
+  std::vector<Matrix<FloatType>> y(iters);
+  
+  for(int i=0;i<iters;i++){
+    x[i] = Matrix<FloatType>(1,1, i+1);
+
+    FloatType ival = i+1;
+    for(int r=0;r<nranks;r++)
+      ival = B + A*ival;
+
+    y[i] = Matrix<FloatType>(1,1, 1.05*ival);
+  }
+
+     * @brief Computes expected losses and derivatives for comparison.
+   
+  if(!rank) std::cout << "Computing expectations" << std::endl;
+  std::vector<FloatType> expect_l(iters);
+  std::vector<Vector<FloatType> > expect_d(iters, Vector<FloatType>(test_model.nparams()) );
+  for(int i=0;i<iters;i++){
+    expect_l[i] = test_cost.loss(x[i],y[i]);
+    expect_d[i] = test_cost.deriv();
+  }
+  
+     * @brief Starts the test loop for the loss pipeline.
+   
+  if(!rank) std::cout << "Starting test loop" << std::endl;
+  for(int i=0;i<iters;i++){
+    int i_vpipe = i-(value_lag-1);
+    FloatType loss = pc.loss(x[i],y[i]).first;
+    FloatType loss_expect = i_vpipe < 0? -1. : expect_l[i_vpipe];
+
+    int i_dpipe = i-(deriv_lag-1); 
+    Vector<FloatType> deriv = pc.deriv().first;
+    Vector<FloatType> deriv_expect = i_dpipe < 0? Vector<FloatType>(nparams,-1.) : expect_d[i_dpipe];
+    
+    if(!rank){
+      std::cout << i << "\tvalue expect " << loss_expect << " got "<<  loss << std::endl;
+      std::cout << "\tderiv expect " << deriv_expect << " got " << deriv << std::endl;
+      assert(near(loss_expect,loss,FloatType(1e-4)));
+      assert(near(deriv_expect,deriv,FloatType(1e-4),true));
+    }
+  }
+}
+ * @brief Tests the batched cost pipeline.
+ 
+if(1){ 
+     * @brief Prints a message indicating that the batched cost pipeline is being tested.
+   
+  if(!rank) std::cout << "Testing batch loss pipeline" << std::endl;
+
+     * @brief Defines parameters for batched testing.
+   
+  int glob_batch_size = 6*nranks;
+  int call_batch_size = 2;
+
+  int input_dims_2[2] = {input_features, call_batch_size};  
+  int block_output_dims_2[2] = {1, call_batch_size};
+  
+     * @brief Creates a pipeline block for the neural network layer.
+   
+  auto p = pipeline_block<Matrix<FloatType>, Matrix<FloatType> >( dnn_layer(input_layer<FloatType>(), winit,binit), block_output_dims_2, rank == nranks -1? input_dims_2 : block_output_dims_2);
+     * @brief Wraps the pipeline with a batched cost function wrapper.
+   
+  BatchPipelineCostFuncWrapper<decltype(p),MSEcostFunc<Matrix<FloatType>> > pc(p, call_batch_size);
+
+     * @brief Generates input and output data for batched testing.
+   
+  Matrix<FloatType> x(input_features, glob_batch_size);
+  Matrix<FloatType> y(1, glob_batch_size);
+
+  for(int i=0;i<glob_batch_size;i++){
+    pokeColumn(x,i,Vector<FloatType>(1,i+1));
+
+    FloatType ival = i+1;
+    for(int r=0;r<nranks;r++)
+      ival = B + A*ival;
+
+    pokeColumn(y, i, Vector<FloatType>(1, 1.05*ival) );
+  }
+  
+     * @brief Builds the same model on the current rank.
+   
+  auto test_model = enwrap( input_layer<FloatType>() );
+  for(int r=0;r<nranks;r++) test_model = enwrap( dnn_layer(std::move(test_model), winit,binit) ); 
+     * @brief Computes the mean squared error cost.
+   
+  auto test_cost = mse_cost(test_model);
+
+     * @brief Computes expected loss and derivative for comparison.
+   
+  FloatType loss_expect = test_cost.loss(x,y);
+  Vector<FloatType> deriv_expect = test_cost.deriv();
+
+     * @brief Computes actual loss and derivative using the pipeline.
+   
+  FloatType loss_got = pc.loss(x,y);
+  Vector<FloatType> deriv_got = pc.deriv();
+
+  if(!rank){
+    std::cout << "Loss - got " << loss_got << " expect " << loss_expect << std::endl;
+    std::cout << "Deriv - got " << deriv_got << " expect " << deriv_expect << std::endl;
+    assert(near(loss_expect,loss_got,FloatType(1e-4)));
+    assert(near(deriv_expect,deriv_got,FloatType(1e-4),true));
+  }
+}
+}* This comment was generated by meta-llama/Llama-3.3-70B-Instruct:None at temperature 0.2.
+*/ 
 void testPipeline(){
   typedef float FloatType;
   
@@ -187,6 +424,13 @@ void testPipeline(){
 }
 
 
+/**
+ * @brief Program entry point
+ * @param argc Number of command line arguments
+ * @param argv Array of command line argument strings
+ * @return Exit status of the program
+ * This comment was generated by meta-llama/Llama-3.3-70B-Instruct:None at temperature 0.2.
+*/ 
 int main(int argc, char** argv){
   initialize(argc, argv);
 
